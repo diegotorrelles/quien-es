@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shrikhand&family=Figtree:wght@400;600;800&family=JetBrains+Mono:wght@600;800&display=swap">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <style>
 /* Plató de concurso sobre mantel de Navidad. Presentador: escenario + mesa de control. Jugador: un pulsador a pantalla completa. */
 :root{
@@ -153,7 +153,7 @@ body{margin:0}
       <button id="fs" type="button">Pantalla completa</button>
     </div>
   </header>
-  <div class="warn" id="fileWarn" hidden>Has abierto el archivo directamente desde el ordenador. Los móviles no pueden conectarse así: abre el juego desde su dirección web (Netlify o GitHub Pages).</div>
+  <div class="warn" id="fileWarn" hidden>Has abierto el archivo directamente desde el ordenador, así que el QR no servirá a los móviles. Abre el juego desde su dirección web de GitHub Pages.</div>
 
   <div class="game">
     <div class="stage" id="stage">
@@ -203,7 +203,7 @@ body{margin:0}
         <div class="joinbox">
           <div class="qr" id="qr" aria-label="Código QR para los móviles"></div>
           <div style="display:flex;flex-direction:column;gap:8px;min-width:0">
-            <p class="small">Escanea el código con cada móvil y elige equipo. Mejor si todos estáis en el mismo WiFi.</p>
+            <p class="small">Escanea el código con cada móvil y elige equipo. Funciona con WiFi o con datos móviles.</p>
             <span class="url" id="url">Preparando enlace…</span>
             <button id="copy" type="button" disabled>Copiar enlace</button>
           </div>
@@ -242,10 +242,11 @@ const store = {
   set(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} }
 };
 const rand = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghjkmnpqrstuvwxyz23456789"[b % 31]).join("");
-const PEER_OPTS = { debug: 0 };
-
-const hostId = (location.hash.match(/^#j=([a-z0-9-]+)$/) || [])[1];
-if (hostId) startPlayer(hostId); else startHost();
+/* Servidores públicos gratuitos de mensajería (MQTT por WebSocket). Solo viajan equipos, puntos y pulsaciones; nunca las fotos. */
+const BROKERS = ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt", "wss://test.mosquitto.org:8081/mqtt"];
+const NS = "quienes-navidad-v1/";
+const joinMatch = location.hash.match(/^#s=([a-z0-9]{4,16})-(\d)$/);
+if (joinMatch) startPlayer(joinMatch[1], +joinMatch[2] % BROKERS.length); else startHost();
 
 /* =================== PRESENTADOR =================== */
 function startHost(){
@@ -256,7 +257,8 @@ function startHost(){
   let answering = null, blocked = [], lastResult = null, resultSeq = 0;
   const epoch = rand(6);
   let roundSeq = 0, roundKey = epoch + "-0";
-  const conns = new Map(); // connectionId -> { conn, team }
+  const phones = new Map(); // id del móvil -> { team, seen }
+  let client = null, bi = 0, base = "";
 
   const cv = $("cv"), ctx = cv.getContext("2d");
   const off = document.createElement("canvas"), octx = off.getContext("2d");
@@ -303,8 +305,10 @@ function startHost(){
       blocked, name: revealed ? (photos[idx]?.name || "") : "",
       teams: teams.map(t => ({ name: t.name.slice(0, 40), pts: t.pts })), result: lastResult };
   }
-  function sendTo(conn){ try { if (conn.open) conn.send(publicState()); } catch(e){} }
-  function broadcast(){ for (const { conn } of conns.values()) sendTo(conn); }
+  function broadcast(){
+    if (!client?.connected) return;
+    try { client.publish(base + "state", JSON.stringify(publicState()), { qos: 0, retain: true }); } catch(e){}
+  }
 
   function updateUI(){
     const total = photos.length;
@@ -349,9 +353,9 @@ function startHost(){
 
   function renderTeams(){
     const max = Math.max(...teams.map(t => t.pts));
-    const phones = [...conns.values()];
+    const list = [...phones.values()];
     $("teams").innerHTML = teams.map((t, i) => {
-      const n = phones.filter(p => p.team === i).length;
+      const n = list.filter(p => p.team === i).length;
       return `<div class="team ${max > 0 && t.pts === max ? "lead" : ""} ${blocked.includes(i) ? "blocked" : ""}" style="--c:${COLORS[i % COLORS.length]}">
         <span class="dot"></span>
         <input id="team-${i}" value="${esc(t.name)}" aria-label="Nombre del equipo ${i+1}" data-i="${i}">
@@ -406,12 +410,14 @@ function startHost(){
     e.target.value = "";
   });
 
-  /* --- Sala: los móviles se conectan directamente a este portátil --- */
+  /* --- Sala: el portátil y los móviles se hablan a través de un servidor de mensajes público --- */
   const isFile = location.protocol === "file:";
   $("fileWarn").hidden = !isFile;
   function setConn(ok, text){ $("conn").classList.toggle("on", ok); $("conn").querySelector("span").textContent = text; }
-  function showLink(id){
-    const url = location.href.split("#")[0] + "#j=" + id;
+  let room = store.get("quien-room", null);
+  if (!/^[a-z0-9]{6,16}$/.test(room || "")){ room = rand(8); store.set("quien-room", room); }
+  function showLink(){
+    const url = location.href.split("#")[0] + "#s=" + room + "-" + bi;
     $("url").textContent = url; $("qr").innerHTML = "";
     try { new QRCode($("qr"), { text: url, width: 120, height: 120, colorDark: "#0b1f19", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.M }); } catch(e){}
     $("copy").disabled = false;
@@ -422,51 +428,67 @@ function startHost(){
     };
   }
 
-  function onData(cid, d){
-    const c = conns.get(cid); if (!c || !d || typeof d !== "object") return;
-    if (d.t === "team"){ c.team = Number.isInteger(d.team) && teams[d.team] ? d.team : null; renderTeams(); sendTo(c.conn); return; }
+  function onData(d){
+    if (!d || typeof d !== "object" || typeof d.id !== "string" || d.id.length > 24) return;
+    const team = Number.isInteger(d.team) && teams[d.team] ? d.team : null;
+    if (d.t === "bye"){ if (phones.delete(d.id)) renderTeams(); return; }
+    const known = phones.get(d.id);
+    phones.set(d.id, { team, seen: Date.now() });
+    if (!known || known.team !== team) renderTeams();
+    if (!known) broadcast();
     if (d.t === "buzz"){
-      const t = c.team;
-      if (d.round !== roundKey || t == null || !teams[t] || revealed || answering || blocked.includes(t) || !photos.length) return;
-      answering = { team: t, peer: cid }; stopAuto(); beep(520, .45); updateUI();
+      if (d.round !== roundKey || team == null || revealed || answering || blocked.includes(team) || !photos.length) return;
+      answering = { team, peer: d.id }; stopAuto(); beep(520, .45); updateUI();
     }
   }
 
-  let peer = null;
   function openRoom(){
-    if (typeof Peer === "undefined"){ setConn(false, "Sin conexión a internet"); return; }
-    let id = store.get("quien-hostid", null) || "quienes-" + rand(10);
-    peer = new Peer(id, PEER_OPTS);
-    peer.on("open", realId => { store.set("quien-hostid", realId); setConn(true, "Sala abierta"); showLink(realId); });
-    peer.on("connection", conn => {
-      conn.on("open", () => { conns.set(conn.connectionId, { conn, team: null }); renderTeams(); sendTo(conn); });
-      conn.on("data", d => onData(conn.connectionId, d));
-      const gone = () => { if (conns.delete(conn.connectionId)){ if (answering?.peer === conn.connectionId){ /* sigue respondiendo en voz alta */ } renderTeams(); } };
-      conn.on("close", gone); conn.on("error", gone);
+    if (typeof mqtt === "undefined"){ setConn(false, "Sin conexión a internet"); setTimeout(() => location.reload(), 8000); return; }
+    base = NS + room + "/";
+    let ok = false;
+    const c = mqtt.connect(BROKERS[bi], { clientId: "qe_h_" + rand(10), clean: true, connectTimeout: 6000, reconnectPeriod: 2000, keepalive: 20 });
+    client = c;
+    const fallback = setTimeout(() => {
+      if (ok) return;
+      try { c.end(true); } catch(e){}
+      bi = (bi + 1) % BROKERS.length; setConn(false, "Probando otro servidor…"); openRoom();
+    }, 7000);
+    c.on("connect", () => {
+      ok = true; clearTimeout(fallback);
+      setConn(true, "Sala abierta");
+      c.subscribe(base + "in", { qos: 0 });
+      showLink(); broadcast();
     });
-    peer.on("disconnected", () => { setConn(false, "Reconectando…"); setTimeout(() => { try { peer.reconnect(); } catch(e){} }, 1500); });
-    peer.on("error", err => {
-      if (err.type === "unavailable-id"){ store.set("quien-hostid", null); try { peer.destroy(); } catch(e){} setTimeout(openRoom, 400); }
-      else if (["network", "server-error", "socket-error", "socket-closed"].includes(err.type)){ setConn(false, "Reconectando…"); }
-    });
+    c.on("reconnect", () => setConn(false, "Reconectando…"));
+    c.on("offline", () => setConn(false, "Sin conexión, reconectando…"));
+    c.on("message", (topic, payload) => { if (topic !== base + "in") return; let d; try { d = JSON.parse(payload.toString()); } catch(e){ return; } onData(d); });
   }
   openRoom();
-  setInterval(broadcast, 2500);
+  setInterval(() => {
+    broadcast();
+    const now = Date.now(); let changed = false;
+    for (const [id, p] of phones) if (now - p.seen > 15000){ phones.delete(id); changed = true; }
+    if (changed) renderTeams();
+  }, 4000);
   renderPhotos(); render(false); updateUI();
 }
 
 /* =================== JUGADOR =================== */
-function startPlayer(hostId){
+function startPlayer(room, bi){
   $("player").hidden = false;
-  let S = null, myTeam = store.get("quien-myteam-" + hostId, null), lastSeq = null, hostSeen = 0;
-  let peer = null, conn = null, myCid = null, retry = null;
+  const base = NS + room + "/";
+  let myId = store.get("quien-pid", null);
+  if (!/^[a-z0-9]{8,16}$/.test(myId || "")){ myId = rand(10); store.set("quien-pid", myId); }
+  let S = null, myTeam = store.get("quien-myteam-" + room, null), lastSeq = null, hostSeen = 0, client = null;
 
   function setConn(ok, text){ $("pconn").classList.toggle("on", ok); $("pconn").querySelector("span").textContent = text; }
-  function send(msg){ try { if (conn?.open) conn.send(msg); } catch(e){} }
+  function send(msg){ try { if (client?.connected) client.publish(base + "in", JSON.stringify({ ...msg, id: myId, team: myTeam }), { qos: 0 }); } catch(e){} }
   function body(html, cls = ""){ $("pBody").className = "p-main " + cls; $("pBody").innerHTML = html; }
+  const stale = () => !S || Date.now() - hostSeen > 12000;
 
   function render(){
-    if (!S || !conn?.open){ body(`<p class="p-msg">Conectando con el portátil…</p><p class="p-sub">Asegúrate de que el juego está abierto en el portátil. Si tarda, prueba a conectarte al mismo WiFi.</p>`); $("pScore").innerHTML = ""; return; }
+    if (!client?.connected){ body(`<p class="p-msg">Conectando…</p><p class="p-sub">Suele tardar uno o dos segundos. Comprueba que el móvil tiene internet.</p>`); $("pScore").innerHTML = ""; return; }
+    if (stale()){ body(`<p class="p-msg">Esperando al portátil…</p><p class="p-sub">Abre el juego en el portátil y esta pantalla se activará sola.</p>`); $("pScore").innerHTML = ""; return; }
     $("pScore").innerHTML = S.teams.map((t, i) => `<div style="--c:${COLORS[i % COLORS.length]}"><span>${esc(t.name)}</span><b>${t.pts}</b></div>`).join("");
     if (myTeam == null || !S.teams[myTeam]){
       $("pBody").className = "pick";
@@ -478,7 +500,7 @@ function startPlayer(hostId){
     const a = S.answering;
     if (S.phase === "empty") return body(head + `<p class="p-msg">Sin fotos</p><p class="p-sub">El presentador está preparando la partida.</p>`);
     if (S.phase === "revealed") return body(head + `<p class="p-msg">${S.name ? "¡Era " + esc(S.name) + "!" : "Foto revelada"}</p><p class="p-sub">Esperad a la siguiente foto.</p>`);
-    if (a && a.peer === myCid) return body(head + `<p class="p-msg">¡Te toca!</p><p class="p-sub">Di tu respuesta en voz alta. El presentador decide si es correcta.</p>`, "mine");
+    if (a && a.peer === myId) return body(head + `<p class="p-msg">¡Te toca!</p><p class="p-sub">Di tu respuesta en voz alta. El presentador decide si es correcta.</p>`, "mine");
     if (a && a.team === myTeam) return body(head + `<p class="p-msg">Responde tu equipo</p><p class="p-sub">Otro móvil de tu equipo ha pulsado primero.</p>`, "mine");
     if (a) return body(head + `<p class="p-msg">Responde ${esc(S.teams[a.team]?.name || "otro equipo")}</p><p class="p-sub">Si falla, podrás pulsar tú.</p>`);
     const blocked = S.blocked?.includes(myTeam);
@@ -492,10 +514,10 @@ function startPlayer(hostId){
   $("pBody").addEventListener("click", e => {
     keepAwake();
     const t = e.target.closest("[data-team]");
-    if (t){ myTeam = +t.dataset.team; store.set("quien-myteam-" + hostId, myTeam); send({ t: "team", team: myTeam }); render(); return; }
-    if (e.target.closest("#change")){ myTeam = null; store.set("quien-myteam-" + hostId, null); send({ t: "team", team: null }); render(); return; }
+    if (t){ myTeam = +t.dataset.team; store.set("quien-myteam-" + room, myTeam); send({ t: "hello" }); render(); return; }
+    if (e.target.closest("#change")){ myTeam = null; store.set("quien-myteam-" + room, null); send({ t: "hello" }); render(); return; }
     if (e.target.closest("#press")){
-      if (!S || S.phase !== "open" || S.blocked?.includes(myTeam)) return;
+      if (stale() || S.phase !== "open" || S.blocked?.includes(myTeam)) return;
       send({ t: "buzz", round: S.round });
       try { navigator.vibrate?.(80); } catch(_){}
       const b = $("press"); if (b){ b.disabled = true; b.textContent = "¡Pulsado!"; }
@@ -512,35 +534,32 @@ function startPlayer(hostId){
     try { navigator.vibrate?.(r.delta > 0 ? [60, 40, 60] : 300); } catch(_){}
   }
 
-  function scheduleRetry(){ clearTimeout(retry); retry = setTimeout(connect, 2500); }
   function connect(){
-    if (!peer || peer.destroyed){ return openPeer(); }
-    if (peer.disconnected){ try { peer.reconnect(); } catch(e){} }
-    if (conn?.open) return;
-    setConn(false, "Conectando…"); render();
-    const c = peer.connect(hostId, { reliable: true });
-    conn = c;
-    c.on("open", () => { myCid = c.connectionId; setConn(true, "Conectado"); send({ t: "team", team: myTeam }); });
-    c.on("data", d => {
+    if (typeof mqtt === "undefined"){ setConn(false, "Sin internet"); setTimeout(() => location.reload(), 6000); return; }
+    client = mqtt.connect(BROKERS[bi], {
+      clientId: "qe_p_" + myId + "_" + rand(3), clean: true, connectTimeout: 6000, reconnectPeriod: 1500, keepalive: 20,
+      will: { topic: base + "in", payload: JSON.stringify({ t: "bye", id: myId }), qos: 0, retain: false }
+    });
+    client.on("connect", () => { setConn(true, "Conectado"); client.subscribe(base + "state", { qos: 0 }); send({ t: "hello" }); render(); });
+    client.on("reconnect", () => { setConn(false, "Reconectando…"); render(); });
+    client.on("offline", () => { setConn(false, "Sin conexión"); render(); });
+    client.on("message", (topic, payload) => {
+      if (topic !== base + "state") return;
+      let d; try { d = JSON.parse(payload.toString()); } catch(e){ return; }
       if (!d || d.t !== "state" || !Array.isArray(d.teams)) return;
-      const prevRound = S?.round; S = d; hostSeen = Date.now();
+      S = d; hostSeen = Date.now();
       if (myTeam != null && !S.teams[myTeam]) myTeam = null;
       showResult(S.result); render();
     });
-    const lost = () => { if (conn === c){ setConn(false, "Reconectando…"); S = null; render(); scheduleRetry(); } };
-    c.on("close", lost); c.on("error", lost);
   }
-  function openPeer(){
-    if (typeof Peer === "undefined"){ setConn(false, "Sin internet"); return; }
-    peer = new Peer(PEER_OPTS);
-    peer.on("open", () => connect());
-    peer.on("error", err => { setConn(false, err.type === "peer-unavailable" ? "Esperando al portátil…" : "Reconectando…"); scheduleRetry(); });
-    peer.on("disconnected", () => scheduleRetry());
-  }
-  // Si el portátil deja de enviar, el móvil vuelve a llamar
-  setInterval(() => { if (conn?.open && Date.now() - hostSeen > 8000){ try { conn.close(); } catch(e){} } }, 3000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden){ keepAwake(); if (!conn?.open) connect(); } });
-  openPeer();
+
+  let wasStale = true;
+  setInterval(() => {
+    send({ t: "hello" });
+    const s = stale(); if (s !== wasStale){ wasStale = s; render(); }
+  }, 4000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden){ keepAwake(); if (client && !client.connected) try { client.reconnect(); } catch(e){} } });
+  connect();
   render();
 }
 </script>
